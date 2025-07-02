@@ -6,6 +6,7 @@ import libnacl
 from libnacl import utils
 import logging
 import os
+import nacl.bindings
 
 # 配置日志
 logging.basicConfig(
@@ -21,15 +22,16 @@ libnacl.sodium_init()
 
 # 加载公私钥对
 script_dir = os.path.dirname(os.path.abspath(__file__))
-with open(script_dir+'/../../secret/key.sec', "rb") as f:
+with open(script_dir + "/../../secret/key.sec", "rb") as f:
     seed = f.read()
-ed_pk,ed_sk = libnacl.crypto_sign_seed_keypair(seed)
-with open(script_dir+'/../../secret/key.pub', "rb") as f:
+ed_pk, ed_sk = libnacl.crypto_sign_seed_keypair(seed)
+with open(script_dir + "/../../secret/key.pub", "rb") as f:
     ed_pkv = f.read()
 if ed_pkv != ed_pk:
-    raise ValueError('Public key not matched')
+    raise ValueError("Public key not matched")
 
-def handshake(conn: socket.socket,addr):
+
+def handshake(conn: socket.socket, addr):
     try:
         # 接收 client_random
         client_random = recv(conn)
@@ -41,6 +43,8 @@ def handshake(conn: socket.socket,addr):
         server_eph_pub, server_eph_sec = (
             libnacl.crypto_kx_keypair()
         )  # 服务器临时 ECDH 公私钥对
+
+        logging.info(f"Q_s:{server_eph_pub.hex()}")
 
         # 对 H(Q_s || client_random || server_random) 签名
         signature = libnacl.crypto_sign_detached(
@@ -67,14 +71,19 @@ def handshake(conn: socket.socket,addr):
             logging.error("Unexcepted cr,sr")
             conn.close()
             return
-        logging.info("cr,sr confirmed，accept Q_c")
+        logging.info(f"cr,sr confirmed，accept Q_c:{client_eph_pub.hex()}")
 
         # 使用客户端临时公钥发送 SealedBox(OK)
         boxed_ok = libnacl.crypto_box_seal(OK, client_eph_pub)
         send(conn, boxed_ok)
 
         # 计算预主密钥
-        pre_master_secret = libnacl.crypto_box_beforenm(client_eph_pub, server_eph_sec)
+        pre_master_secret = nacl.bindings.crypto_scalarmult(
+            server_eph_sec, client_eph_pub
+        )
+
+        logging.info("DEBUG pre_master_secret: %s", pre_master_secret.hex())
+
         # 计算主密钥 M = H(Z || client_random || server_random)
         master_secret = libnacl.crypto_hash_sha256(
             pre_master_secret + client_random + server_random
@@ -86,7 +95,7 @@ def handshake(conn: socket.socket,addr):
         nonce_client = recv(conn)
         enc_fingerprint = recv(conn)
         raw_fingerprint = libnacl.crypto_aead_aes256gcm_decrypt(
-            enc_fingerprint, None, nonce_client, master_secret
+            enc_fingerprint, b"", nonce_client, master_secret
         )
         if not prnu.verfiy_device(raw_fingerprint):
             logging.info("Device not matched")
@@ -95,11 +104,13 @@ def handshake(conn: socket.socket,addr):
         logging.info("Device matched")
 
         # 发送 OK 消息
-        nonce_server = utils.rand_nonce()
-        send(conn, nonce_server)
+        nonce_server = utils.rand_aead_nonce()
+        
         final_ok = libnacl.crypto_aead_aes256gcm_encrypt(
-            OK, None, nonce_server, master_secret
+            OK, b'', nonce_server, master_secret
         )
+
+        send(conn, nonce_server)
         send(conn, final_ok)
         print("mtlsp handshake succeed!")
     except Exception as e:
